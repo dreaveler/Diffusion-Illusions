@@ -213,6 +213,76 @@ class StableDiffusion(nn.Module):
 
         return output
 
+    def train_step_image(self,
+                         prompt_rgb:torch.Tensor,
+                         pred_rgb:torch.Tensor,
+                         t:Optional[int]=None,
+                         prompt_latent_coef=1.0,
+                         prompt_image_coef=0.0,
+                         use_lowpass=True,
+                         lowpass_kernel=5,
+                         lowpass_sigma=1.0,
+                         lowpass_latent_only=True,
+                        ):
+        """
+        Image-prompt guidance step that pulls pred_rgb toward prompt_rgb in latent/image space.
+        This is not text-conditioned SDS; it is a direct image guidance step.
+        """
+        if rp.is_image(prompt_rgb):
+            prompt_rgb = rp.as_rgb_image(rp.as_float_image(prompt_rgb))
+            prompt_rgb = rp.as_torch_image(prompt_rgb).to(self.device)
+
+        if isinstance(prompt_rgb, torch.Tensor) and prompt_rgb.ndim == 3:
+            prompt_rgb = prompt_rgb[None]
+
+        if isinstance(pred_rgb, torch.Tensor) and pred_rgb.ndim == 3:
+            pred_rgb = pred_rgb[None]
+
+        pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
+        prompt_rgb_512 = F.interpolate(prompt_rgb, (512, 512), mode='bilinear', align_corners=False)
+
+        def _gaussian_blur(img_bchw, k=5, sigma=1.0):
+            if k < 3 or sigma <= 0:
+                return img_bchw
+            ax = torch.arange(k, device=img_bchw.device) - k // 2
+            xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+            kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+            kernel = kernel / kernel.sum()
+            kernel = kernel[None, None, :, :].repeat(img_bchw.shape[1], 1, 1, 1)
+            return F.conv2d(img_bchw, kernel, padding=k // 2, groups=img_bchw.shape[1])
+
+        if use_lowpass:
+            pred_rgb_512_lp = _gaussian_blur(pred_rgb_512, k=lowpass_kernel, sigma=lowpass_sigma)
+            prompt_rgb_512_lp = _gaussian_blur(prompt_rgb_512, k=lowpass_kernel, sigma=lowpass_sigma)
+        else:
+            pred_rgb_512_lp = pred_rgb_512
+            prompt_rgb_512_lp = prompt_rgb_512
+
+        if t is None:
+            t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
+
+        assert 0<=t<self.num_train_timesteps, 'invalid timestep t=%i'%t
+
+        latents = self.encode_imgs(pred_rgb_512_lp).to(self.device)
+        with torch.no_grad():
+            prompt_latents = self.encode_imgs(prompt_rgb_512_lp).to(self.device)
+
+        w = (1 - self.alphas[t])
+
+        if prompt_latent_coef:
+            latent_delta = latents - prompt_latents
+            latents.backward(gradient=w * latent_delta * prompt_latent_coef, retain_graph=True)
+
+        if prompt_image_coef:
+            if lowpass_latent_only:
+                image_delta = pred_rgb_512 - prompt_rgb_512
+                pred_rgb_512.backward(gradient=w * image_delta * prompt_image_coef, retain_graph=True)
+            else:
+                image_delta = pred_rgb_512_lp - prompt_rgb_512_lp
+                pred_rgb_512_lp.backward(gradient=w * image_delta * prompt_image_coef, retain_graph=True)
+
+        return latents
+
     def produce_latents(self, text_embeddings:torch.Tensor, height:int=512, width:int=512, num_inference_steps=50, guidance_scale=7.5, latents=None)->torch.Tensor:
         assert len(text_embeddings.shape)==3 and text_embeddings.shape[-2:]==(77,768)
         assert not len(text_embeddings)%2
